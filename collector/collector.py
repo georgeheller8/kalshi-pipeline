@@ -5,7 +5,7 @@ Kalshi market-data collector.
 - Lists every open market over REST, shards the tickers across several
   WebSocket connections, and subscribes to `orderbook_delta` for all of them.
 - Subscribes to `trade` and `market_lifecycle_v2` (all markets) on connection 0,
-  adds newly activated markets live and drops determined/settled ones.
+  adds newly created markets the moment they open and drops determined/settled ones.
 - Writes every raw message, wrapped with a local receive timestamp, to an
   hourly zstd-compressed JSONL file. Finished hours are moved to
   data/closed/date=YYYY-MM-DD/ for the rclone upload timer.
@@ -53,6 +53,9 @@ N_CONN = int(env("N_CONN", "4"))              # WebSocket connections per proces
 CHUNK = int(env("CHUNK", "500"))              # tickers per orderbook subscription
 INCLUDE_MVE = env("INCLUDE_MVE", "0") == "1"  # include multivariate combo markets
 REFRESH_SECS = int(env("REFRESH_SECS", "1800"))  # full market re-scan (safety net)
+# A market announced by a `created` lifecycle message is subscribed this many seconds
+# after its open_ts (whether subscribing before open is accepted is unverified).
+OPEN_LAG_SECS = float(env("OPEN_LAG_SECS", "1"))
 ZSTD_LEVEL = int(env("ZSTD_LEVEL", "1"))
 # Run N_SHARDS processes (one per core); each records the markets whose
 # crc32(ticker) % N_SHARDS == SHARD. Shard 0 also records the trade channel.
@@ -322,6 +325,7 @@ class Collector:
         self.conns = [Conn(i, self) for i in range(N_CONN)]
         self.where: dict[str, tuple[int, int]] = {}  # ticker -> (conn, chunk)
         self.new_tickers: asyncio.Queue[str] = asyncio.Queue()
+        self.opening: dict[str, asyncio.TimerHandle] = {}  # created, not open yet -> scheduled add
         self.msgs = 0
         self.gaps = 0
         self.session: aiohttp.ClientSession | None = None
@@ -391,14 +395,29 @@ class Collector:
 
     # -- lifecycle
     async def on_lifecycle(self, msg: dict):
+        """New markets arrive as `created`, usually hours before they open (open_ts),
+        and nothing more is sent when they open. So the add is scheduled for just after
+        open_ts. `activated` (a paused market resuming) is handled the same way."""
         t, et = msg.get("market_ticker"), msg.get("event_type")
         if not t:
             return
-        if et == "activated":
-            if mine(t):
-                await self.new_tickers.put(t)
+        if et in ("created", "activated"):
+            if mine(t) and t not in self.where and t not in self.opening:
+                open_ts = msg.get("open_ts")
+                delay = open_ts + OPEN_LAG_SECS - time.time() if isinstance(open_ts, (int, float)) else 0
+                if delay > 0:
+                    self.opening[t] = asyncio.get_running_loop().call_later(delay, self._opened, t)
+                else:
+                    await self.new_tickers.put(t)
         elif et in ("determined", "settled"):
+            handle = self.opening.pop(t, None)
+            if handle:
+                handle.cancel()
             await self.remove_market(t)
+
+    def _opened(self, t: str):
+        self.opening.pop(t, None)
+        self.new_tickers.put_nowait(t)
 
     async def new_market_loop(self):
         """Batch newly activated tickers; check them over REST (applies the
