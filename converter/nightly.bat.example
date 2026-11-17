@@ -1,0 +1,21 @@
+@echo off
+rem Nightly converter run for the Windows machine.
+rem Copy this file to C:\kalshi-convert\nightly.bat (OUTSIDE the repo, so updating the
+rem code never edits a running batch file), set the two values below, and point the
+rem scheduled task at the copy.
+set BUCKET=gh-kalshi-raw
+set HC_URL=
+
+set ROOT=C:\kalshi-convert
+set REPO=%ROOT%\kalshi-pipeline
+cd /d "%ROOT%"
+echo ==== %date% %time% ====>> convert.log
+
+rem Use the latest commit that passed CI (the same branch the collector deploys from).
+git -C "%REPO%" fetch --quiet origin deploy >> convert.log 2>&1 && git -C "%REPO%" checkout --quiet --detach origin/deploy >> convert.log 2>&1
+if errorlevel 1 echo could not update the code; running the version already checked out>> convert.log
+
+".venv\Scripts\python.exe" -m pip install --quiet -r "%REPO%\converter\requirements.txt" >> convert.log 2>&1
+".venv\Scripts\python.exe" "%REPO%\converter\convert.py" --raw b2:%BUCKET%/raw --out b2:%BUCKET%/parquet --work "%ROOT%\work" >> convert.log 2>&1
+if errorlevel 1 exit /b %errorlevel%
+if not "%HC_URL%"=="" curl -fsS -m 10 --retry 3 "%HC_URL%" > nul 2>&1

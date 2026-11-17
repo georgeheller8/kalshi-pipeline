@@ -1,0 +1,10 @@
+[Unit]
+Description=Deploy the latest tested commit of kalshi-pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+EnvironmentFile=-/home/ubuntu/collector/collector.env
+ExecStart=/home/ubuntu/kalshi-pipeline/deploy/deploy.sh

@@ -1,0 +1,19 @@
+[Unit]
+Description=Kalshi market-data collector (shard %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+# State (config, key, data, venv) lives in ~/collector; code comes from the repo checkout.
+WorkingDirectory=/home/ubuntu/collector
+EnvironmentFile=/home/ubuntu/collector/collector.env
+Environment=SHARD=%i
+ExecStart=/home/ubuntu/collector/.venv/bin/python -u /home/ubuntu/kalshi-pipeline/collector/collector.py
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

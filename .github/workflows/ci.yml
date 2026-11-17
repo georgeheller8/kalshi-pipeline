@@ -1,0 +1,52 @@
+name: ci
+
+# Tests run on every push. When they pass on main, the `deploy` branch is moved to that
+# commit. The collector VM and the converter machine only ever pull `deploy`, so
+# untested code never reaches them. Nothing here can reach those machines directly.
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            collector/requirements.txt
+            converter/requirements.txt
+            requirements-dev.txt
+      - run: pip install -r collector/requirements.txt -r converter/requirements.txt -r requirements-dev.txt
+      - run: shellcheck -S warning deploy/deploy.sh
+      - run: pytest -q
+
+  promote:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: promote-deploy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Move deploy to this commit (forward only)
+        run: |
+          if git fetch --quiet origin deploy; then
+            if ! git merge-base --is-ancestor origin/deploy "$GITHUB_SHA"; then
+              echo "deploy is already at a newer commit; leaving it"
+              exit 0
+            fi
+          fi
+          git push origin "$GITHUB_SHA:refs/heads/deploy"
+          echo "deploy -> ${GITHUB_SHA::10}"

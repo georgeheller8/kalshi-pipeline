@@ -1,0 +1,12 @@
+[Unit]
+Description=Upload closed Kalshi files to B2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Nice=10
+EnvironmentFile=/home/ubuntu/collector/collector.env
+ExecStart=/usr/bin/rclone move /home/ubuntu/collector/data/closed b2:${B2_BUCKET}/raw --min-age 5m --checksum --transfers 4 --delete-empty-src-dirs --log-file /home/ubuntu/rclone.log --log-level INFO
+ExecStartPost=/bin/sh -c '[ -z "$UPLOAD_HEALTHCHECK_URL" ] || curl -fsS -m 10 --retry 3 "$UPLOAD_HEALTHCHECK_URL" >/dev/null'

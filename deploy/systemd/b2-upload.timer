@@ -1,0 +1,9 @@
+[Unit]
+Description=Hourly B2 upload
+
+[Timer]
+OnCalendar=*:10
+Persistent=true
+
+[Install]
+WantedBy=timers.target

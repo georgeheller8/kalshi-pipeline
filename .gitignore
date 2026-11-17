@@ -1,0 +1,19 @@
+# Secrets and machine-local config: never commit these
+*.key
+*.pem
+collector.env
+rclone.conf
+nightly.bat
+
+# Data and scratch
+data/
+work/
+*.jsonl.zst
+*.parquet
+*.duckdb
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

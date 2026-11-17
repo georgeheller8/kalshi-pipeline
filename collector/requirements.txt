@@ -1,0 +1,6 @@
+websockets>=14
+aiohttp>=3.9
+zstandard>=0.22
+cryptography>=42
+orjson>=3.9
+uvloop>=0.19

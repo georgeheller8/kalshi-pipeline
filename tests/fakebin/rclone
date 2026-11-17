@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Test stand-in for rclone: maps the remote 'fake:' onto $FAKE_REMOTE. Only the calls convert.py makes."""
+import sys, os, json, shutil
+from pathlib import Path
+def loc(p): return Path(os.environ["FAKE_REMOTE"])/p[5:] if p.startswith("fake:") else Path(p)
+a = sys.argv[1:]; cmd = a[0]
+if cmd == "lsjson":
+    assert a[1:5] == ["-R","--files-only","--no-modtime","--no-mimetype"], a
+    base = loc(a[5])
+    if not base.is_dir(): print("directory not found", file=sys.stderr); sys.exit(3)
+    print(json.dumps([{"Path":p.relative_to(base).as_posix(),"Name":p.name,"Size":p.stat().st_size,"IsDir":False} for p in base.rglob("*") if p.is_file()]))
+elif cmd == "copy":
+    import time
+    src, dst = loc(a[1]), loc(a[2]); rest = a[3:]
+    hang = os.environ.get("FAKE_HANG_ONCE")
+    if hang and Path(hang).exists():
+        Path(hang).unlink()
+        print(time.strftime("%Y/%m/%d %H:%M:%S") + " NOTICE:    120.000 MiB / 1.723 GiB, 7%, 0 B/s, ETA -", file=sys.stderr, flush=True)
+        time.sleep(3600)   # stalled: no further progress
+    if "--stats" in rest:
+        for k, (got, pct) in enumerate([("0 B", 0), ("812.000 MiB", 46), ("1.723 GiB", 100)]):
+            print(time.strftime("%Y/%m/%d %H:%M:%S") + f" NOTICE:    {got} / 1.723 GiB, {pct}%, 25.302 MiB/s, ETA {3 - k}s", file=sys.stderr, flush=True)
+    if "--files-from-raw" in rest:
+        for r in Path(rest[rest.index("--files-from-raw")+1]).read_text().splitlines():
+            (dst/r).parent.mkdir(parents=True, exist_ok=True); shutil.copy2(src/r, dst/r)
+    else:
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+elif cmd == "sync":
+    src, dst = loc(a[1]), loc(a[2])
+    if not src.is_dir(): print("directory not found", file=sys.stderr); sys.exit(3)
+    shutil.rmtree(dst, ignore_errors=True); shutil.copytree(src, dst)
+elif cmd == "deletefile":
+    loc(a[1]).unlink()
+else:
+    sys.exit(f"unexpected rclone call {a}")
