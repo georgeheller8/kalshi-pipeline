@@ -11,6 +11,8 @@ Kalshi market-data collector.
   data/closed/date=YYYY-MM-DD/ for the rclone upload timer.
 - Detects per-subscription `seq` gaps, logs them into the data stream, and
   requests fresh snapshots for the affected connection.
+- Reconnects (which subscribes everything again) whenever Kalshi ends a
+  subscription, and exits if one of its own tasks dies, so systemd restarts it.
 
 Config comes from environment variables (see collector.env.example).
 """
@@ -21,6 +23,7 @@ import os
 import random
 import re
 import signal
+import sys
 import time
 import zlib
 from datetime import datetime, timezone
@@ -78,11 +81,33 @@ OB_HEAD = re.compile(rb'\{"type":"orderbook_(delta|snapshot)","sid":(\d+),"seq":
 # Redundant fields dropped from deltas before writing: market_id (a random UUID
 # that duplicates market_ticker and barely compresses) and the deprecated
 # string `ts` (duplicates ts_ms). Snapshots are kept intact, so they still
-# record the ticker -> market_id mapping.
+# record the ticker -> market_id mapping. Kalshi's spec marks both `ts` and
+# `ts_ms` optional, so `ts` is only dropped from a delta that carries `ts_ms`.
 DELTA_STRIP = re.compile(rb',"(?:market_id":"[0-9a-f-]{36}|ts":"[^"]*)"')
+DELTA_STRIP_ID = re.compile(rb',"market_id":"[0-9a-f-]{36}"')
+# Error codes that mean "not applied, send it again": 10 channel error (answering a
+# subscribe), 18 command timeout, 27 too many requests. Sent again after RETRY_SECS,
+# doubling each time, MAX_TRIES sends in all.
+RETRY_CODES = (10, 18, 27)
+RETRY_SECS = 2.0
+MAX_TRIES = 5
+# A new market that REST does not list yet is looked up again after these many seconds
+# (Kalshi: a market may not be queryable right after its `created` event).
+LOOKUP_RETRY_SECS = (5, 20, 60)
+FIRST_REFRESH_SECS = 20   # the first rescan after start-up; then every REFRESH_SECS
+STABLE_SECS = 30          # a connection that lasted this long resets the reconnect backoff
 
 logging.basicConfig(level=logging.INFO, format=f"%(asctime)s %(levelname)s [s{SHARD}] %(message)s")
 log = logging.getLogger("collector")
+
+
+def parse_ts(s: str) -> float | None:
+    """A REST timestamp such as '2026-11-17T06:50:00Z' as unix seconds; None if absent or unreadable."""
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
 
 
 # ---------------------------------------------------------------- auth
@@ -175,56 +200,119 @@ class Conn:
         self.c = coll
         self.chunks: list[list[str]] = []
         self.ob_sid: int | None = None             # the orderbook_delta subscription
-        self.pending: dict[int, int | None] = {}   # command id -> chunk index
+        # command id -> (cmd, params, times sent before): what an `error` reply refers to
+        self.pending: dict[int, tuple[str, dict, int]] = {}
         self.last_seq: dict[int, int] = {}
         self.resnap_task: asyncio.Task | None = None
+        self.resnap_again = False                  # a gap arrived that a running pass may predate
+        self.retries: set[asyncio.Task] = set()    # commands waiting to be sent again
         self.ws = None
         self.next_id = 1
+        self.sub_pos = 0          # chunks subscribe_all has sent on this connection so far
+        self.subscribed = False   # subscribe_all has sent every chunk
+        self.closing = False      # reconnect() was called on this connection
+        self.degraded = False     # the trade or lifecycle channel could not be subscribed
 
     def total(self) -> int:
         return sum(len(ch) for ch in self.chunks)
 
-    async def send(self, cmd: str, params: dict, chunk_idx: int | None = None):
-        if self.ws is None:
-            return
+    def ready(self) -> bool:
+        """Connected, with everything subscribed. This is what `conns_up` counts, and so
+        what the deploy script and the healthcheck ping wait for."""
+        return (self.ws is not None and self.subscribed and not self.degraded
+                and (self.ob_sid is not None or not self.total()))
+
+    async def send(self, cmd: str, params: dict, tries: int = 0, remember: dict | None = None) -> bool:
+        """Send one command. False if it could not be sent because the connection is down
+        or closing: everything in `chunks` is subscribed again once it is back."""
+        ws = self.ws
+        if ws is None:
+            return False
         cid = self.next_id
         self.next_id += 1
-        self.pending[cid] = chunk_idx
-        await self.ws.send(orjson.dumps({"id": cid, "cmd": cmd, "params": params}).decode())
+        self.pending[cid] = (cmd, params if remember is None else remember, tries)
+        try:
+            await ws.send(orjson.dumps({"id": cid, "cmd": cmd, "params": params}).decode())
+        except websockets.ConnectionClosed:
+            self.pending.pop(cid, None)
+            return False
+        return True
 
-    async def subscribe_tickers(self, tickers: list[str], chunk_idx: int | None = None):
+    async def subscribe_tickers(self, tickers: list[str]):
         if tickers:
-            await self.send("subscribe", {"channels": ["orderbook_delta"],
-                                          "market_tickers": list(tickers)}, chunk_idx)
+            await self.send("subscribe", {"channels": ["orderbook_delta"], "market_tickers": list(tickers)})
 
     async def subscribe_all(self):
-        if self.idx == 0:
-            await self.send("subscribe", {"channels": ["market_lifecycle_v2"]})
-            if SHARD == 0:
-                await self.send("subscribe", {"channels": ["trade"]})
-        for i in range(len(self.chunks)):
-            await self.subscribe_tickers(self.chunks[i], i)
-            await asyncio.sleep(0.2)  # stay well under the command rate limit
+        try:
+            if self.idx == 0:
+                await self.send("subscribe", {"channels": ["market_lifecycle_v2"]})
+                if SHARD == 0:
+                    await self.send("subscribe", {"channels": ["trade"]})
+            while self.sub_pos < len(self.chunks):  # len() each time: chunks can be appended meanwhile
+                chunk = self.chunks[self.sub_pos]
+                self.sub_pos += 1                   # from here on, additions to it go through add_tickers()
+                if chunk:
+                    await self.subscribe_tickers(chunk)
+                    await asyncio.sleep(0.2)        # stay well under the command rate limit
+            self.subscribed = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("conn %d: subscribing failed; reconnecting", self.idx)
+            await self.reconnect()
 
-    async def retry_subscribe(self, i: int, delay: float):
-        await asyncio.sleep(delay)
-        if self.ws is not None and i < len(self.chunks):
-            await self.subscribe_tickers(self.chunks[i], i)
+    async def add_tickers(self, tickers: list[str]):
+        """Subscribe tickers that are already in `chunks`, CHUNK per command."""
+        for k in range(0, len(tickers), CHUNK):
+            if k:
+                await asyncio.sleep(0.2)
+            part = tickers[k:k + CHUNK]
+            if self.ob_sid is not None:
+                await self.send("update_subscription", {"sids": [self.ob_sid], "action": "add_markets",
+                                                        "market_tickers": part})
+            else:
+                # Still subscribing: a plain subscribe gets merged into the subscription.
+                await self.subscribe_tickers(part)
+
+    async def resend(self, cmd: str, params: dict, tries: int):
+        """Send a command again after Kalshi answered it with one of RETRY_CODES."""
+        ws = self.ws
+        await asyncio.sleep(min(RETRY_SECS * 2 ** tries, 30) + random.random() * RETRY_SECS / 2)
+        if ws is None or self.ws is not ws:
+            return  # reconnected meanwhile, which subscribed everything again
+        if "market_tickers" in params:  # leave out markets that were determined meanwhile
+            here = [t for t in params["market_tickers"] if self.c.where.get(t, (-1,))[0] == self.idx]
+            if not here:
+                return
+            params = dict(params, market_tickers=here)
+        await self.send(cmd, params, tries + 1)
+
+    async def reconnect(self):
+        """Close the socket: run() then connects again and subscribes everything from scratch."""
+        ws = self.ws
+        if ws is not None and not self.closing:
+            self.closing = True
+            await ws.close()
 
     async def resnapshot(self):
-        """Fresh snapshots for every market on this connection, in chunks."""
-        for ch in list(self.chunks):
-            if self.ws is None or self.ob_sid is None:
-                return
-            if ch:
-                await self.send("update_subscription", {"sids": [self.ob_sid], "action": "get_snapshot",
-                                                        "market_tickers": list(ch)})
-                await asyncio.sleep(0.2)
+        """Fresh snapshots for every market on this connection, in chunks. A gap that
+        arrives while a pass is running starts another pass afterwards: the chunks
+        already requested got their snapshots before that gap."""
+        while self.resnap_again:
+            self.resnap_again = False
+            for ch in list(self.chunks):
+                if self.ws is None or self.ob_sid is None:
+                    return
+                if ch:
+                    await self.send("update_subscription", {"sids": [self.ob_sid], "action": "get_snapshot",
+                                                            "market_tickers": list(ch)},
+                                    remember={"action": "get_snapshot"})
+                    await asyncio.sleep(0.2)
 
     async def run(self):
         backoff = 1.0
         while True:
-            sub_task = None
+            sub_task = up_since = None
             try:
                 async with websockets.connect(
                     WS_URL,
@@ -234,13 +322,15 @@ class Conn:
                 ) as ws:
                     self.ws = ws
                     self.ob_sid = None
+                    self.sub_pos = 0
+                    self.subscribed = self.closing = self.degraded = self.resnap_again = False
                     self.last_seq.clear()
                     self.pending.clear()
+                    up_since = time.monotonic()
                     log.info("conn %d connected (%d markets in %d chunks)",
                              self.idx, self.total(), len(self.chunks))
                     self.c.event({"type": "collector_connect", "conn": self.idx})
                     sub_task = asyncio.create_task(self.subscribe_all())
-                    backoff = 1.0
                     while True:
                         # decode=False: raw bytes, skipping a UTF-8 decode/encode round trip
                         await self.handle(await ws.recv(decode=False))
@@ -250,11 +340,16 @@ class Conn:
                 log.warning("conn %d dropped: %r", self.idx, e)
             finally:
                 self.ws = None
-                for task in (sub_task, self.resnap_task):
+                self.subscribed = False
+                for task in (sub_task, self.resnap_task, *self.retries):
                     if task:
                         task.cancel()
                 self.resnap_task = None
             self.c.event({"type": "collector_disconnect", "conn": self.idx})
+            # Back to the shortest wait only after a connection that held for a while: one
+            # that is accepted and dropped again right away must not be retried in a tight loop.
+            if up_since is not None and time.monotonic() - up_since >= STABLE_SECS:
+                backoff = 1.0
             await asyncio.sleep(backoff + random.random())
             backoff = min(backoff * 2, 60)
 
@@ -265,8 +360,10 @@ class Conn:
             self.c.gaps += 1
             self.c.event({"type": "collector_gap", "conn": self.idx, "sid": sid,
                           "expected": last + 1, "got": seq})
-            if sid == self.ob_sid and (self.resnap_task is None or self.resnap_task.done()):
-                self.resnap_task = asyncio.create_task(self.resnapshot())
+            if sid == self.ob_sid:
+                self.resnap_again = True
+                if self.resnap_task is None or self.resnap_task.done():
+                    self.resnap_task = asyncio.create_task(self.resnapshot())
         self.last_seq[sid] = seq
 
     async def handle(self, raw):
@@ -278,7 +375,7 @@ class Conn:
         head = OB_HEAD.match(data)
         if head:  # the vast majority of traffic
             if head[1] == b"delta":
-                data = DELTA_STRIP.sub(b"", data)
+                data = (DELTA_STRIP if b'"ts_ms":' in data else DELTA_STRIP_ID).sub(b"", data)
             self.c.writer.write(b'{"recv_ns":%d,"conn":%d,"msg":%s}\n' % (recv_ns, self.idx, data))
             self.check_seq(int(head[2]), int(head[3]))
             return
@@ -302,20 +399,45 @@ class Conn:
             self.pending.pop(m.get("id"), None)
             if body.get("channel") == "orderbook_delta":
                 self.ob_sid = body.get("sid")
-        elif t in ("ok", "unsubscribed"):
+        elif t == "ok":
             self.pending.pop(m.get("id"), None)
+        elif t == "unsubscribed":
+            # We never unsubscribe, so Kalshi ended this subscription (it follows a terminal
+            # error: 25 buffer overflow, 10 channel error). The connection stays open and
+            # would look healthy while that subscription's data has silently stopped.
+            if not self.closing:
+                log.error("conn %d: subscription %s was ended by Kalshi; reconnecting", self.idx, sid)
+            await self.reconnect()
         elif t == "error":
-            ci = self.pending.pop(m.get("id"), None)
-            code = body.get("code")
-            log.error("conn %d error: %s", self.idx, body)
-            if code == 27 and ci is not None:      # command rate limit
-                asyncio.create_task(self.retry_subscribe(ci, 2.0))
-            elif code == 26:
-                log.error("per-subscription market limit hit: raise N_CONN")
-            elif code == 25:                        # buffer overflow: reconnect + resnapshot
-                await self.ws.close()
+            await self.on_error(m, body)
         elif t == "market_lifecycle_v2":
-            await self.c.on_lifecycle(body)
+            self.c.on_lifecycle(body)
+
+    async def on_error(self, m: dict, body: dict):
+        sent = self.pending.pop(m.get("id"), None)
+        if self.closing:
+            return  # replies to commands that were in flight when the subscription ended
+        cmd, params, tries = sent or ("", {}, 0)
+        code = body.get("code")
+        log.error("conn %d error: %s%s", self.idx, body,
+                  f" (answering {cmd} {params.get('action') or params.get('channels')})" if sent else "")
+        ended = code == 25 or (m.get("sid") is not None and m.get("id") is None)
+        if ended or code == 7 or params.get("action") == "get_snapshot":
+            # Kalshi ended a subscription (25 buffer overflow, 10 channel error: sent with
+            # the subscription's sid and no command id), no longer knows our sid (7), or
+            # could not resynchronise after a gap. Only subscribing again brings the data back.
+            await self.reconnect()
+        elif sent and code in RETRY_CODES and tries + 1 < MAX_TRIES:
+            task = asyncio.create_task(self.resend(cmd, params, tries))
+            self.retries.add(task)
+            task.add_done_callback(self.retries.discard)
+        elif "market_tickers" in params:
+            # These markets are not being recorded. Forget them, so the next rescan adds them again.
+            self.c.forget(self.idx, params["market_tickers"])
+        elif cmd == "subscribe":
+            # No trade / lifecycle feed on this connection. It stops counting as up, so the
+            # healthcheck alerts (and a deploy that caused it is rolled back).
+            self.degraded = True
 
 
 # ---------------------------------------------------------------- collector
@@ -325,7 +447,10 @@ class Collector:
         self.conns = [Conn(i, self) for i in range(N_CONN)]
         self.where: dict[str, tuple[int, int]] = {}  # ticker -> (conn, chunk)
         self.new_tickers: asyncio.Queue[str] = asyncio.Queue()
-        self.opening: dict[str, asyncio.TimerHandle] = {}  # created, not open yet -> scheduled add
+        # created, not open yet: ticker -> (timer that queues it when it opens, its open time)
+        self.opening: dict[str, tuple[asyncio.TimerHandle, float]] = {}
+        self.lookup_tries: dict[str, int] = {}  # new tickers REST did not list yet -> lookups so far
+        self.rest_slots = asyncio.Semaphore(4)   # concurrent new-market lookups
         self.msgs = 0
         self.gaps = 0
         self.session: aiohttp.ClientSession | None = None
@@ -336,8 +461,9 @@ class Collector:
                           % (time.time_ns(), orjson.dumps(ev)))
 
     # -- REST
-    async def get_markets(self, params: dict) -> list[str]:
-        tickers, cursor = [], ""
+    async def get_markets(self, params: dict) -> dict[str, str]:
+        """Every market matching params, all pages, as {ticker: open_time}."""
+        found, cursor = {}, ""
         while True:
             q = dict(params, limit="1000")
             if cursor:
@@ -350,12 +476,30 @@ class Collector:
                     await asyncio.sleep(2)
                     continue
                 r.raise_for_status()
-                data = await r.json()
-            tickers += [mk["ticker"] for mk in data.get("markets", [])]
+                data = orjson.loads(await r.read())  # ~2 MB a page: orjson stalls the event loop least
+            for mk in data.get("markets", []):
+                found[mk["ticker"]] = mk.get("open_time") or ""
             cursor = data.get("cursor") or ""
             if not cursor:
-                return tickers
+                return found
             await asyncio.sleep(0.1)
+
+    async def lookup(self, tickers: list[str]) -> dict[str, str]:
+        async with self.rest_slots:
+            return await self.get_markets({"tickers": ",".join(tickers)})
+
+    async def scan(self) -> int:
+        """One pass over REST; returns how many markets it added. Markets that have not
+        opened yet are scheduled for their open time, which is also what restores the
+        schedule after a restart. Open markets that are not being recorded are added.
+        Unopened first: a market that opens between the two listings is in one of them."""
+        for t, open_time in (await self.get_markets({"status": "unopened"})).items():
+            open_ts = parse_ts(open_time)
+            if open_ts is not None and mine(t):
+                self.schedule(t, open_ts)
+        missing = [t for t in await self.get_markets({"status": "open"})
+                   if mine(t) and t not in self.where]
+        return await self.add_markets(missing)
 
     # -- sharding
     def _assign(self, t: str):
@@ -370,94 +514,160 @@ class Collector:
         self.where[t] = (conn.idx, i)
         return conn, i
 
-    async def add_market(self, t: str):
-        if t in self.where:
-            return
-        conn, i = self._assign(t)
-        if conn.ws is None:
-            return  # picked up by subscribe_all on (re)connect
-        if conn.ob_sid is not None:
-            await conn.send("update_subscription", {"sids": [conn.ob_sid], "action": "add_markets",
-                                                    "market_tickers": [t]}, i)
-        else:
-            # Still subscribing: a plain subscribe gets merged into the subscription.
-            await conn.subscribe_tickers([t], i)
+    async def add_markets(self, tickers) -> int:
+        """Start recording tickers; returns how many were new. Each connection gets its
+        share in one command, not one command per ticker: Kalshi answers every add with
+        the subscription's whole ticker list (~800 KB), and a rescan that added 1,500
+        markets one by one made it drop the subscriptions with buffer overflows."""
+        share: dict[int, list[str]] = {}
+        n = 0
+        for t in tickers:
+            if t in self.where:
+                continue
+            conn, i = self._assign(t)
+            n += 1
+            # Otherwise subscribe_all includes it: on (re)connect, or when it reaches that chunk.
+            if conn.ws is not None and (conn.subscribed or i < conn.sub_pos):
+                share.setdefault(conn.idx, []).append(t)
+        results = await asyncio.gather(*(self.conns[i].add_tickers(ts) for i, ts in share.items()),
+                                       return_exceptions=True)
+        for (i, ts), res in zip(share.items(), results):
+            if isinstance(res, Exception):
+                log.error("conn %d: adding %d markets failed: %r", i, len(ts), res)
+                self.forget(i, ts)
+        return n
 
-    async def remove_market(self, t: str):
+    def remove_market(self, t: str):
+        """Stop tracking a determined market. Nothing is sent: Kalshi takes a determined
+        market out of the subscription itself (after a last, empty snapshot), so a
+        delete_markets command changed nothing and only cost another ~800 KB reply."""
         loc = self.where.pop(t, None)
-        if loc is None:
-            return
-        conn = self.conns[loc[0]]
-        conn.chunks[loc[1]].remove(t)
-        if conn.ob_sid is not None and conn.ws is not None:
-            await conn.send("update_subscription", {"sids": [conn.ob_sid], "action": "delete_markets",
-                                                    "market_tickers": [t]}, loc[1])
+        if loc is not None:
+            self.conns[loc[0]].chunks[loc[1]].remove(t)
+
+    def forget(self, conn_idx: int, tickers):
+        """Tickers a connection failed to subscribe: drop them, so a rescan tries again."""
+        for t in tickers:
+            if self.where.get(t, (-1,))[0] == conn_idx:
+                self.remove_market(t)
 
     # -- lifecycle
-    async def on_lifecycle(self, msg: dict):
-        """New markets arrive as `created`, usually hours before they open (open_ts),
-        and nothing more is sent when they open. So the add is scheduled for just after
-        open_ts. `activated` (a paused market resuming) is handled the same way."""
-        t, et = msg.get("market_ticker"), msg.get("event_type")
-        if not t:
+    def schedule(self, t: str, open_ts: float):
+        """Queue market t for subscribing just after it opens (right away if it already has)."""
+        if t in self.where:
             return
-        if et in ("created", "activated"):
-            if mine(t) and t not in self.where and t not in self.opening:
-                open_ts = msg.get("open_ts")
-                delay = open_ts + OPEN_LAG_SECS - time.time() if isinstance(open_ts, (int, float)) else 0
-                if delay > 0:
-                    self.opening[t] = asyncio.get_running_loop().call_later(delay, self._opened, t)
-                else:
-                    await self.new_tickers.put(t)
-        elif et in ("determined", "settled"):
-            handle = self.opening.pop(t, None)
-            if handle:
-                handle.cancel()
-            await self.remove_market(t)
+        old = self.opening.get(t)
+        if old is not None:
+            if old[1] == open_ts:
+                return
+            self.unschedule(t)  # its opening time changed
+        delay = open_ts + OPEN_LAG_SECS - time.time()
+        if delay > 0:
+            self.opening[t] = (asyncio.get_running_loop().call_later(delay, self._opened, t), open_ts)
+        else:
+            self.new_tickers.put_nowait(t)
+
+    def unschedule(self, t: str):
+        old = self.opening.pop(t, None)
+        if old is not None:
+            old[0].cancel()
 
     def _opened(self, t: str):
         self.opening.pop(t, None)
         self.new_tickers.put_nowait(t)
 
+    def on_lifecycle(self, msg: dict):
+        """New markets arrive as `created`, usually hours before they open (open_ts), and
+        nothing more is sent when they open, so the add is scheduled for just after open_ts.
+        `activated` means a paused or closed market trades again: add it now if it is not
+        being recorded."""
+        t, et = msg.get("market_ticker"), msg.get("event_type")
+        if not t or not mine(t):
+            return
+        if et == "created" and isinstance(msg.get("open_ts"), (int, float)):
+            self.schedule(t, msg["open_ts"])
+        elif et in ("created", "activated"):
+            if t not in self.where:
+                self.unschedule(t)
+                self.new_tickers.put_nowait(t)
+        elif et in ("determined", "settled"):
+            self.unschedule(t)
+            self.remove_market(t)
+
+    def lookup_later(self, t: str):
+        n = self.lookup_tries.get(t, 0)
+        if n < len(LOOKUP_RETRY_SECS):
+            self.lookup_tries[t] = n + 1
+            asyncio.get_running_loop().call_later(LOOKUP_RETRY_SECS[n], self.new_tickers.put_nowait, t)
+        else:
+            self.lookup_tries.pop(t, None)  # give up: a rescan adds it once REST lists it as open
+
+    async def add_new(self, tickers: list[str]):
+        """Check new tickers over REST, 100 per request (it leaves out combo markets and
+        gives their current open time), then subscribe them."""
+        todo = [t for t in tickers if t not in self.where]
+        pages = [todo[k:k + 100] for k in range(0, len(todo), 100)]
+        found: dict[str, str] = {}
+        for res in await asyncio.gather(*map(self.lookup, pages), return_exceptions=True):
+            if isinstance(res, Exception):
+                log.warning("new-market lookup failed: %r", res)
+            else:
+                found.update(res)
+        now, add = time.time(), []
+        for t in todo:
+            if t not in found:
+                self.lookup_later(t)  # lookup failed, or REST does not list it yet
+                continue
+            self.lookup_tries.pop(t, None)
+            open_ts = parse_ts(found[t])
+            if open_ts is not None and open_ts > now:
+                self.schedule(t, open_ts)  # its opening was moved back
+            else:
+                add.append(t)
+        n = await self.add_markets(add)
+        if n:
+            log.info("added %d new markets", n)
+
     async def new_market_loop(self):
-        """Batch newly activated tickers; check them over REST (applies the
-        combo filter) and subscribe within a few seconds of opening."""
+        """Markets that just opened: collect them for 2 s, so that the thousands opening at
+        the top of an hour become a few commands, and subscribe them."""
         while True:
-            batch = [await self.new_tickers.get()]
+            batch = {await self.new_tickers.get(): None}
             await asyncio.sleep(2)
-            while not self.new_tickers.empty() and len(batch) < 100:
-                batch.append(self.new_tickers.get_nowait())
+            while not self.new_tickers.empty():
+                batch[self.new_tickers.get_nowait()] = None
             try:
-                ok = await self.get_markets({"tickers": ",".join(batch)})
-                for t in ok:
-                    await self.add_market(t)
-                if ok:
-                    log.info("added %d new markets", len(ok))
-            except Exception as e:
-                log.warning("new-market lookup failed: %r", e)
+                await self.add_new(list(batch))
+            except Exception:  # the rescan picks these markets up
+                log.exception("adding new markets failed")
 
     async def refresh_loop(self):
+        # The first pass comes right after start-up: it restores the opening schedule and
+        # catches markets that opened or were created while the collector was starting.
+        delay = min(REFRESH_SECS, FIRST_REFRESH_SECS)
         while True:
-            await asyncio.sleep(REFRESH_SECS)
+            await asyncio.sleep(delay)
+            delay = REFRESH_SECS
             try:
-                missing = [t for t in await self.get_markets({"status": "open"})
-                           if mine(t) and t not in self.where]
-                for t in missing:
-                    await self.add_market(t)
-                if missing:
-                    log.info("refresh added %d markets", len(missing))
+                n = await self.scan()
+                if n:
+                    log.info("refresh added %d markets", n)
             except Exception as e:
                 log.warning("refresh failed: %r", e)
 
     async def housekeeping_loop(self):
-        last_msgs, last_hc = 0, 0.0
+        last_msgs, last_hc, last_up = 0, 0.0, 0
         while True:
             await asyncio.sleep(5)
             self.writer.rotate_if_needed()
             now = time.time()
+            up = sum(c.ready() for c in self.conns)
+            if up != last_up:
+                # Logged as soon as it changes: deploy.sh waits for conns_up=N/N after a restart.
+                log.info("conns_up=%d/%d", up, len(self.conns))
+                last_up = up
             if now - last_hc >= 60:
                 rate = (self.msgs - last_msgs) / max(now - last_hc, 1) if last_hc else 0
-                up = sum(c.ws is not None for c in self.conns)
                 log.info("msgs=%d (%.0f/s) gaps=%d markets=%d conns_up=%d/%d",
                          self.msgs, rate, self.gaps, len(self.where), up, len(self.conns))
                 if HC_URL and up == len(self.conns) and self.msgs > last_msgs:
@@ -468,7 +678,7 @@ class Collector:
                         pass
                 last_msgs, last_hc = self.msgs, now
 
-    async def main(self):
+    async def main(self) -> int:
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for s in (signal.SIGTERM, signal.SIGINT):
@@ -481,22 +691,25 @@ class Collector:
             log.info("shard %d/%d: bootstrapped %d open markets across %d connections",
                      SHARD, N_SHARDS, len(tickers), N_CONN)
 
-            tasks = [asyncio.create_task(c.run()) for c in self.conns]
-            tasks += [asyncio.create_task(f()) for f in
+            tasks = [asyncio.create_task(c.run(), name=f"conn {c.idx}") for c in self.conns]
+            tasks += [asyncio.create_task(f(), name=f.__name__) for f in
                       (self.new_market_loop, self.refresh_loop, self.housekeeping_loop)]
-            await stop.wait()
+            stopping = asyncio.create_task(stop.wait())
+            done, _ = await asyncio.wait([stopping, *tasks], return_when=asyncio.FIRST_COMPLETED)
+            # None of these tasks is meant to end. If one did, exit with an error: systemd
+            # restarts the collector, which beats running on without a connection or a loop.
+            died = [t for t in done if t is not stopping]
+            for t in died:
+                log.critical("%s ended unexpectedly: %r", t.get_name(),
+                             "cancelled" if t.cancelled() else t.exception())
             log.info("shutting down")
+            stopping.cancel()
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         self.writer.close()
+        return 1 if died else 0
 
 
 if __name__ == "__main__":
-    if uvloop is not None:
-        uvloop.run(Collector().main())
-    else:
-        asyncio.run(Collector().main())
-
-
-# deployment test comment
+    sys.exit((uvloop.run if uvloop is not None else asyncio.run)(Collector().main()))

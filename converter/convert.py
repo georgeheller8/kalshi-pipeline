@@ -23,6 +23,7 @@ Raw files are never modified or deleted by this script.
 import argparse
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -434,40 +435,45 @@ def convert_hour(stamp: str, inputs: list[dict], raw: Store, out: Store, work: P
             raise RuntimeError(f"{f.name}: downloaded {f.stat().st_size} bytes, listing says {meta['size']}")
 
     con = duckdb.connect(str(hour_dir / "stage.duckdb"))
-    con.execute(f"SET threads = {args.threads}")
-    con.execute(f"SET memory_limit = {q(args.memory_limit)}")
-    con.execute(f"SET temp_directory = {q((hour_dir / 'tmp').as_posix())}")
-    con.execute("SET preserve_insertion_order = false")
-
-    repaired = []
     try:
-        load_stage(con, files)
-    except duckdb.OutOfMemoryException:
-        raise  # not a damaged file: retrying through the repair path would not help
-    except duckdb.Error as e:
-        # Most likely a file cut off by a collector crash. Salvage every complete record.
-        log.warning("%s: direct read failed (%s); rewriting inputs and retrying",
-                    stamp, str(e).splitlines()[0][:200])
-        fix_dir = hour_dir / "fixed"
-        fix_dir.mkdir()
-        fixed = []
-        for f in files:
-            dst = fix_dir / f.name
-            if repair_zst(f, dst):
-                repaired.append(f.name)
-                log.warning("%s: %s was truncated; kept all complete records", stamp, f.name)
-            fixed.append(dst)
-        load_stage(con, fixed)
+        con.execute(f"SET threads = {args.threads}")
+        con.execute(f"SET memory_limit = {q(args.memory_limit)}")
+        con.execute(f"SET temp_directory = {q((hour_dir / 'tmp').as_posix())}")
+        con.execute("SET preserve_insertion_order = false")
 
-    n = con.execute("SELECT count(*) FROM stage").fetchone()[0]
-    log.info("%s: loaded %d records at %.0fs; verifying", stamp, n, time.time() - t0)
-    if n == 0:
-        raise CheckFailed("no records could be read from the raw files")
-    stats = run_checks(con)
-    log.info("%s: verified at %.0fs; writing Parquet", stamp, time.time() - t0)
-    written = write_tables(con, out_dir, date, stamp, args.zstd_level, args.rows_per_file)
+        repaired = []
+        try:
+            load_stage(con, files)
+        except duckdb.OutOfMemoryException:
+            raise  # not a damaged file: retrying through the repair path would not help
+        except duckdb.Error as e:
+            # Most likely a file cut off by a collector crash. Salvage every complete record.
+            log.warning("%s: direct read failed (%s); rewriting inputs and retrying",
+                        stamp, str(e).splitlines()[0][:200])
+            fix_dir = hour_dir / "fixed"
+            fix_dir.mkdir()
+            fixed = []
+            for f in files:
+                dst = fix_dir / f.name
+                if repair_zst(f, dst):
+                    repaired.append(f.name)
+                    log.warning("%s: %s was truncated; kept all complete records", stamp, f.name)
+                fixed.append(dst)
+            load_stage(con, fixed)
+
+        n = con.execute("SELECT count(*) FROM stage").fetchone()[0]
+        log.info("%s: loaded %d records at %.0fs; verifying", stamp, n, time.time() - t0)
+        if n == 0:
+            raise CheckFailed("no records could be read from the raw files")
+        stats = run_checks(con)
+        log.info("%s: verified at %.0fs; writing Parquet", stamp, time.time() - t0)
+        written = write_tables(con, out_dir, date, stamp, args.zstd_level, args.rows_per_file)
+    finally:
+        # Also when the hour fails: the exception keeps this connection alive while main()
+        # cleans up, and Windows cannot delete a database file that is still open, so the
+        # failed hour's scratch files (tens of GB) would stay behind.
+        con.close()
     rows = written["rows"]
-    con.close()
     log.info("%s: wrote Parquet at %.0fs; uploading", stamp, time.time() - t0)
 
     bytes_out = sum(p.stat().st_size for p in out_dir.rglob("*.parquet"))
@@ -481,6 +487,12 @@ def convert_hour(stamp: str, inputs: list[dict], raw: Store, out: Store, work: P
         "repaired_inputs": repaired, **stats,
         "seconds": round(time.time() - t0, 1),
     }
+    # An hour that is being converted again: take its old manifest down before touching its
+    # files. A run that dies part-way through the upload then leaves the hour "not done"
+    # (redone next time), not an old done-marker sitting on a mix of old and new files.
+    if any(f["path"] == f"{stamp}.json" for f in out.ls(f"_manifests/date={date}")):
+        out.delete(f"_manifests/date={date}/{stamp}.json")
+        log.info("%s: removed the previous manifest before replacing the hour's files", stamp)
     out.upload_tree(out_dir, "")
     # A reconverted hour may have been split differently before: remove its old files.
     new = set(written["files"])
@@ -533,13 +545,41 @@ def plan(raw: Store, out: Store, work: Path, args) -> list[tuple[str, list[dict]
             continue  # hour may not be fully uploaded yet
         inputs = sorted(hours[stamp], key=lambda f: f["path"])
         man = done.get(stamp)
-        if man and not args.force:
+        if man:
             had = {(f["path"], f["size"]) for f in man.get("inputs", [])}
-            if all((f["path"], f["size"]) in had for f in inputs):
+            if not args.force and all((f["path"], f["size"]) in had for f in inputs):
                 continue  # nothing new for this hour (raw files expiring later is fine)
-            log.info("%s: raw inputs changed since last conversion; redoing", stamp)
+            gone = {f["path"] for f in man.get("inputs", [])} - {f["path"] for f in inputs}
+            if gone:
+                # Converting again from what is left would replace complete Parquet with less.
+                log.warning("%s: %d of the raw files it was converted from are no longer in --raw; "
+                            "leaving its Parquet as it is", stamp, len(gone))
+                continue
+            if not args.force:
+                log.info("%s: raw inputs changed since last conversion; redoing", stamp)
         todo.append((stamp, inputs))
     return todo
+
+
+def lock_work_dir(work: Path):
+    """One converter per work directory: a second one would delete the first one's scratch
+    files. Returns the lock file's descriptor (the lock lasts until the process ends), or
+    None if another run holds it."""
+    fd = os.open(work / "convert.lock", os.O_RDWR | os.O_CREAT)
+    try:
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\n")          # Windows locks a byte range: make sure byte 0 exists
+        os.lseek(fd, 0, os.SEEK_SET)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 def main():
@@ -570,6 +610,11 @@ def main():
     raw, out = Store(args.raw), Store(args.out)
     work = Path(args.work).expanduser().resolve()
     work.mkdir(parents=True, exist_ok=True)
+    # e.g. the nightly task starting while a long backfill is still running
+    lock = None if args.dry_run else lock_work_dir(work)
+    if lock is None and not args.dry_run:
+        log.error("another convert.py is already running in %s; not starting a second one", work)
+        return 3
 
     todo = plan(raw, out, work, args)
     if args.max_hours:

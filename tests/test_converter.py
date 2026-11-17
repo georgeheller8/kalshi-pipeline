@@ -1,8 +1,10 @@
 """convert.py end to end: output must match an independent parse of the raw records."""
 import json
+import sys
 from pathlib import Path
 
 import pyarrow.parquet as pq
+import pytest
 import zstandard
 
 from conftest import run_convert
@@ -51,7 +53,7 @@ def test_round_trip_local(tmp_path):
 
     code, log, _ = run_convert(raw, out, tmp_path / "work")
     assert code == 0 and any("0 hours to convert" in l for l in log)
-    assert [p.name for p in (tmp_path / "work").iterdir()] == ["_manifests"]
+    assert sorted(p.name for p in (tmp_path / "work").iterdir()) == ["_manifests", "convert.lock"]
 
 
 def test_remote_truncated_input_reruns_and_expiry(tmp_path, fake_remote):
@@ -112,6 +114,56 @@ def test_split_files_and_stale_cleanup(tmp_path, fake_remote):
     assert compare(lines, out)
     assert run_convert(*args, "--force", "--rows-per-file", 7000, env=env)[0] == 0
     assert len(list(deltas.glob("*.parquet"))) == len(files) and compare(lines, out)
+
+
+def test_interrupted_reconversion_is_redone_not_left_half_replaced(tmp_path, fake_remote):
+    """A reconversion that dies while uploading must not leave the old manifest vouching
+    for a mix of old and new files: the next ordinary run has to pick the hour up again."""
+    bucket, env = fake_remote
+    out = bucket / "parquet"
+    args = ("fake:bucket/raw", "fake:bucket/parquet", tmp_path / "work")
+    _, l0 = gen_hour(bucket / "raw", "20261114T12", 0, 1794650000, 30000, 1)
+    _, l1 = gen_hour(bucket / "raw", "20261114T12", 1, 1794650000, 30000, 2, strip=True)
+    lines = [(0, l0), (1, l1)]
+    manifest = out / "_manifests/date=2026-11-14/20261114T12.json"
+    assert run_convert(*args, env=env)[0] == 0 and manifest.exists()
+
+    code, log, _ = run_convert(*args, "--force", "--rows-per-file", 7000,
+                               env=dict(env, FAKE_UPLOAD_DIES_AFTER="2"))
+    assert code == 2 and not manifest.exists()
+    # the old single file plus two of the new parts: every market in those parts is there twice
+    assert len(list((out / "deltas/date=2026-11-14").glob("*.parquet"))) == 3
+
+    code, log, _ = run_convert(*args, env=env)
+    assert code == 0 and manifest.exists() and compare(lines, out)
+
+
+def test_hour_is_not_reconverted_from_what_is_left_of_expired_raw(tmp_path):
+    raw, out = tmp_path / "raw", tmp_path / "parquet"
+    _, l0 = gen_hour(raw, "20261114T12", 0, 1794650000, 3000, 1)
+    expired, l1 = gen_hour(raw, "20261114T12", 1, 1794650000, 3000, 2, strip=True)
+    assert run_convert(raw, out, tmp_path / "work")[0] == 0
+    expired.unlink()
+    gen_hour(raw, "20261114T12", 0, 1794651900, 500, 7)       # and a new file turns up for that hour
+    for extra in ((), ("--force",)):
+        code, log, _ = run_convert(raw, out, tmp_path / "work", *extra)
+        assert code == 0 and any("no longer in --raw" in l for l in log)
+        assert compare([(0, l0), (1, l1)], out)                # still the complete conversion
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the test holds the lock with fcntl")
+def test_second_converter_in_the_same_work_directory_does_not_start(tmp_path):
+    """The nightly task firing while a long backfill is still running, for example."""
+    import fcntl
+    raw, out, work = tmp_path / "raw", tmp_path / "parquet", tmp_path / "work"
+    write_hour(raw, "20261114T01", [delta()])
+    work.mkdir()
+    with open(work / "convert.lock", "a+b") as held:           # what a running converter holds
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        code, log, _ = run_convert(raw, out, work)
+        assert code == 3 and any("already running" in l for l in log) and not out.exists()
+        assert run_convert(raw, out, work, "--dry-run")[0] == 0    # looking is still allowed
+    assert run_convert(raw, out, work)[0] == 0 and (out / "_manifests").exists()
 
 
 def test_ok_echoes_are_slimmed_and_fit_in_little_memory(tmp_path):

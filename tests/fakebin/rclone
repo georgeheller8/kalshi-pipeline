@@ -23,6 +23,11 @@ elif cmd == "copy":
     if "--files-from-raw" in rest:
         for r in Path(rest[rest.index("--files-from-raw")+1]).read_text().splitlines():
             (dst/r).parent.mkdir(parents=True, exist_ok=True); shutil.copy2(src/r, dst/r)
+    elif os.environ.get("FAKE_UPLOAD_DIES_AFTER") and list(src.rglob("*.parquet")):
+        # an upload of Parquet files that is cut off after the first N files
+        for p in sorted(x for x in src.rglob("*") if x.is_file())[:int(os.environ["FAKE_UPLOAD_DIES_AFTER"])]:
+            (dst/p.relative_to(src)).parent.mkdir(parents=True, exist_ok=True); shutil.copy2(p, dst/p.relative_to(src))
+        sys.exit("simulated: connection lost during upload")
     else:
         shutil.copytree(src, dst, dirs_exist_ok=True)
 elif cmd == "sync":

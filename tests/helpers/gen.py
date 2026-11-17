@@ -62,7 +62,7 @@ def gen_hour(root, stamp, shard, start, n, seed, strip=False, n_markets=400, tru
                  "taker_side":rnd.choice(["yes","no"]),"taker_outcome_side":rnd.choice(["yes","no"]),"taker_book_side":rnd.choice(["bid","ask"]),"is_block_trade":rnd.random()<.01,"ts":t_ms//1000,"ts_ms":t_ms}
             emit(0, {"type":"trade","sid":3,"seq":tseq,"msg":m,"sending_ts_ms":t_ms+1})
         elif r < .99:
-            emit(0, {"type":"market_lifecycle_v2","sid":2,"seq":i,"msg":{"market_ticker":tk,"event_type":rnd.choice(["activated","settled","determined","metadata_updated"]),"open_ts":t_ms//1000,"é":"ünï"}})
+            emit(0, {"type":"market_lifecycle_v2","sid":2,"seq":i,"msg":{"market_ticker":tk,"event_type":rnd.choice(["created","settled","determined","close_date_updated","deactivated"]),"open_ts":t_ms//1000,"é":"ünï"}})
         elif r < .995:
             seq[c]+=1
             emit(c, {"type":"ok","id":rnd.randint(2,60),"sid":1,"seq":seq[c],"msg":{"market_tickers":[x[0] for x in rnd.sample(mk, min(50,len(mk)))]}})
