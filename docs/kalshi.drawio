@@ -1,0 +1,94 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Page-1" id="EcrGBEdTZYnjvKFb2MH7">
+    <mxGraphModel dx="655" dy="741" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="R2A885heRJcXW2N8HF8s-1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;roundedPerimeter=1;" value="&lt;b&gt;&lt;font face=&quot;Garamond&quot;&gt;Kalshi Exchange&lt;/font&gt;&lt;/b&gt;&lt;div&gt;&lt;font face=&quot;Garamond&quot;&gt;REST API, WebSocket feed&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="60" width="336" x="176" y="63" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-29" edge="1" parent="1" source="OzT_xBhSuQ6yXF1a0PyS-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;labelPadding=0 4;" target="OzT_xBhSuQ6yXF1a0PyS-3" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;roundedPerimeter=1;" value="&lt;b&gt;&lt;font face=&quot;Garamond&quot;&gt;Collector Shard 0&lt;/font&gt;&lt;/b&gt;&lt;div&gt;&lt;font face=&quot;Garamond&quot;&gt;4 connections, lifecycle updates, trades&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="60" width="140" x="175" y="189" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-30" edge="1" parent="1" source="OzT_xBhSuQ6yXF1a0PyS-2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;labelPadding=0 4;" target="OzT_xBhSuQ6yXF1a0PyS-28" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;roundedPerimeter=1;" value="&lt;b&gt;&lt;font face=&quot;Garamond&quot;&gt;Collector Shard 1&lt;/font&gt;&lt;/b&gt;&lt;div&gt;&lt;font face=&quot;Garamond&quot;&gt;4 connections, lifecycle updates&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="60" width="140" x="372" y="190" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-23" edge="1" parent="1" source="OzT_xBhSuQ6yXF1a0PyS-3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;defaultLabelBackgroundColor=page;labelPadding=0 4;" target="OzT_xBhSuQ6yXF1a0PyS-4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;roundedPerimeter=1;" value="&lt;b&gt;&lt;font face=&quot;Times New Roman&quot;&gt;zstd JSON lines writer&lt;/font&gt;&lt;/b&gt;" vertex="1">
+          <mxGeometry height="60" width="139" x="176" y="290" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-25" edge="1" parent="1" source="OzT_xBhSuQ6yXF1a0PyS-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;labelPadding=0 4;" target="OzT_xBhSuQ6yXF1a0PyS-5" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;roundedPerimeter=1;" value="&lt;font face=&quot;Garamond&quot;&gt;&lt;b&gt;Upload timer (rclone move)&lt;/b&gt;&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="336" x="175" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-26" edge="1" parent="1" source="OzT_xBhSuQ6yXF1a0PyS-5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;labelPadding=0 4;" target="OzT_xBhSuQ6yXF1a0PyS-6" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;roundedPerimeter=1;" value="&lt;b&gt;&lt;font face=&quot;Garamond&quot;&gt;Backblaze B2 (raw/)&lt;/font&gt;&lt;/b&gt;&lt;div&gt;&lt;font face=&quot;Garamond&quot;&gt;Kept until parquet data is validated&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="60" width="336" x="175" y="504" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-27" edge="1" parent="1" source="OzT_xBhSuQ6yXF1a0PyS-6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;labelPadding=0 4;" target="OzT_xBhSuQ6yXF1a0PyS-7" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-6" parent="1" style="rounded=1;whiteSpace=wrap;html=1;roundedPerimeter=1;" value="&lt;b&gt;&lt;font face=&quot;Garamond&quot;&gt;DuckDB Converter&lt;/font&gt;&lt;/b&gt;&lt;div&gt;&lt;font face=&quot;Garamond&quot;&gt;zstd JSON lines -&amp;gt; Parquet&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="60" width="336" x="175" y="607" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-7" parent="1" style="rounded=1;whiteSpace=wrap;html=1;roundedPerimeter=1;" value="&lt;b&gt;&lt;font face=&quot;Garamond&quot;&gt;Backblaze B2 (parquet/)&lt;/font&gt;&lt;/b&gt;" vertex="1">
+          <mxGeometry height="60" width="336" x="175" y="710" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-15" edge="1" parent="1" style="endArrow=none;html=1;rounded=0;defaultLabelBackgroundColor=page;labelPadding=0 4;" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="244.94" y="154.5" as="sourcePoint" />
+            <mxPoint x="341.5" y="154.5" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-16" edge="1" parent="1" style="endArrow=none;html=1;rounded=0;defaultLabelBackgroundColor=page;labelPadding=0 4;" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="338.56" y="154.5" as="sourcePoint" />
+            <mxPoint x="442.5" y="154.5" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-17" edge="1" parent="1" style="endArrow=classic;html=1;rounded=0;defaultLabelBackgroundColor=page;labelPadding=0 4;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="OzT_xBhSuQ6yXF1a0PyS-1" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="245" y="154" as="sourcePoint" />
+            <mxPoint x="307" y="172" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-18" edge="1" parent="1" style="endArrow=classic;html=1;rounded=0;defaultLabelBackgroundColor=page;labelPadding=0 4;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="442" y="154" as="sourcePoint" />
+            <mxPoint x="442" y="190" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-31" edge="1" parent="1" source="OzT_xBhSuQ6yXF1a0PyS-28" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;labelPadding=0 4;" target="OzT_xBhSuQ6yXF1a0PyS-4" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-28" parent="1" style="rounded=1;whiteSpace=wrap;html=1;roundedPerimeter=1;" value="&lt;b&gt;&lt;font face=&quot;Times New Roman&quot;&gt;zstd JSON lines writer&lt;/font&gt;&lt;/b&gt;" vertex="1">
+          <mxGeometry height="60" width="140" x="372" y="290" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-35" edge="1" parent="1" style="endArrow=none;html=1;rounded=0;defaultLabelBackgroundColor=page;labelPadding=0 4;" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="344" y="154.16" as="sourcePoint" />
+            <mxPoint x="344" y="123" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-36" parent="1" style="rounded=1;whiteSpace=wrap;html=1;absoluteArcSize=1;arcSize=14;strokeWidth=1.5;roundedPerimeter=1;fillColor=none;dashed=1;" value="" vertex="1">
+          <mxGeometry height="344" width="353.5" x="166.5" y="139" as="geometry" />
+        </mxCell>
+        <mxCell id="OzT_xBhSuQ6yXF1a0PyS-38" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;rounded=0;" value="&lt;font face=&quot;Garamond&quot; style=&quot;font-size: 11px;&quot;&gt;&lt;i&gt;Oracle Cloud VM&lt;/i&gt;&lt;/font&gt;" vertex="1">
+          <mxGeometry height="30" width="111.5" x="176" y="457" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

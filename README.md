@@ -1,42 +1,45 @@
-# kalshi-pipeline
+# Kalshi Pipeline
 
-Records every orderbook change on every open [Kalshi](https://kalshi.com) market, around the clock, and turns it into Parquet for backtesting.
+Kalshi does not publish historical orderbook data. Its API returns historical prices, but nothing about orderbook depth, queue position, or how resting orders were filled. A realistic backtest, and in particular a fill model, depends on exactly that information. This pipeline records every orderbook change on every open Kalshi market, around the clock, and converts the recordings into Parquet tables for backtesting.
 
-- **Collector** (`collector/`): asyncio service on a 2-core Oracle Cloud Arm VM. About 207,000 markets across 2 processes and 8 WebSocket connections, roughly 18,000–20,000 messages per second. Detects sequence gaps and requests fresh snapshots; writes hourly zstd JSON Lines.
-- **Upload** (`deploy/systemd/b2-upload.*`): hourly rclone move to Backblaze B2, deleting local copies only after a checksum-verified upload.
-- **Converter** (`converter/`): nightly DuckDB job that turns each raw hour into verified `deltas`, `snapshots`, `trades` and `events` Parquet tables, with exact fixed-point integers and a manifest per hour.
+## Flowchart
 
-```
-Kalshi ──WebSocket──▶ collector (VM) ──hourly──▶ B2 raw/ ──nightly──▶ converter ──▶ B2 parquet/
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/darkdiagram.svg">
+  <img alt="Pipeline diagram" src="docs/lightdiagram.svg">
+</picture>
 
-## Data layout
+## Infrastructure
 
-| Table | One row per | Sorted by |
-|---|---|---|
-| `deltas` | orderbook change | market, then receive time |
-| `snapshots` | orderbook snapshot (levels as lists) | market, then receive time |
-| `trades` | public trade | market, then receive time |
-| `events` | everything else, as raw JSON (lifecycle, acks, the collector's own connect/gap records) | receive time |
+**Oracle Cloud Infrastructure**: The collector runs on an Always Free Arm instance with 2 OCPUs and 12 GB of memory, running Ubuntu 24.04 Minimal. The VM is in the US-East (Ashburn) region, the closest available region to Kalshi's exchange infrastructure in Columbus, which keeps network latency and the risk of falling behind the feed low.
 
-Prices are integers in 1/10,000 dollar (`price_e4`: 2000 = $0.20); sizes in 1/100 contract (`delta_e2`: 14800 = 148.00). Files live at `parquet/<table>/date=YYYY-MM-DD/`; a busy hour may be split into several `_pNN` files, each holding a disjoint set of markets, so read whole folders.
+**Backblaze B2**: A single bucket holds both the raw recordings and the converted Parquet tables. B2 was chosen for its low storage cost ($6.95 per TB per month on the pay-as-you-go plan), which matters at roughly 75 GB of compressed raw data on a busy day. Raw files are retained until the Parquet output has been validated against a backtester.
 
-## How code reaches the machines
+**Razer Blade 14**: Conversion runs on a Windows laptop rather than on the VM. The VM's two cores are already 55-70% busy with the collector, and a collector that falls behind loses data permanently, so all heavy processing happens elsewhere. A scheduled task on the laptop runs the converter nightly.
 
-Nothing on GitHub can reach the machines; they pull.
+**Raspberry Pi** (planned): A fill model needs data with as few gaps as possible, and an extended outage of either the VM or B2 would leave holes that cannot be recovered later. A Raspberry Pi running a second, independent copy of the collector, with local storage as a fallback for B2, would protect against both. The two feeds can be merged afterwards using the exchange's message ordering.
 
-1. Every push runs the tests (`.github/workflows/ci.yml`).
-2. When tests pass on `main`, CI moves the `deploy` branch forward to that commit.
-3. The VM checks `deploy` every 2 minutes (`deploy/deploy.sh`, run by `kalshi-deploy.timer`). On a new commit it installs changed dependencies and systemd units, then restarts the collector shards **one at a time**, waiting for each to report all connections up. A shard that doesn't recover rolls everything back to the previous commit, and that commit is not retried.
-4. The converter machine checks out `deploy` at the start of each nightly run (`converter/nightly.bat.example`).
+## Collector Software
 
-Secrets (`kalshi.key`, `collector.env`, rclone config) stay on the machines and are git-ignored.
+**Kalshi Exchange**: Kalshi offers two interfaces: a REST API for querying markets on request, and a WebSocket feed that pushes updates as they happen. When the collector subscribes to a market's orderbook channel, it gets a snapshot of the book followed by a live stream of every change (deltas). It never has to poll individual markets.
 
-## Development
+**Collector**: On startup, the collector requests the list of open markets from the REST API and subscribes to the orderbook feed of each one. Multivariate combo markets are excluded. It also subscribes to two exchange-wide channels: lifecycle updates, which announce infromation about market creation/settlement, and trade updates, which are a stream of every trade executed on the exchange. As a safety net, the collector repeats the full REST listing every 30 minutes and subscribes to any open market it has missed.
 
-```bash
-pip install -r collector/requirements.txt -r converter/requirements.txt -r requirements-dev.txt
-pytest -q
-```
+The collector runs as two shards, one process per CPU core. The system runs on a 2-core VM, the most available on Oracle Cloud's free tier. Each market is assigned to a shard by a hash of its ticker, and each shard has four WebSocket connections. Within a shard, a new market goes to whichever connection has the fewest markets, which keeps the load balanced. Connection zero of each shard also carries the lifecycle subscription, and each shard acts only on its own markets. Connection zero of shard zero also carries the trade subscription.
 
-The converter tests compare every output table against an independent parse of the raw records, including truncated files, huge order sizes, and stalled downloads. The deploy tests run `deploy.sh` against a simulated VM, including rollback when a shard comes up unhealthy.
+**Writer and Uploader**: Each shard writes every message it receives to a zstd-compressed JSON Lines file. Each line is tagged with a local receive timestamp and the connection the message arrived on. At the top of each UTC hour, the shard closes the current file and moves it to a staging directory. At ten minutes past each hour, a timer runs an rclone job that moves everything in the staging directory to a Backblaze B2 bucket.
+
+Normally an upload is two files, one per shard, but it can be more. A shard that restarts mid-hour starts a new file for that hour, and files from a failed upload go with the next run. A local file is deleted only after it has been uploaded and its checksum verified.
+
+## Converter Software
+
+**Converter**: ...
+
+**Writer and Uploader**: ...
+
+## Test Suite
+
+
+
+## CI/CD
+

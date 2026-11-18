@@ -140,7 +140,7 @@ def sign_headers(method: str, path: str) -> dict:
 
 # ---------------------------------------------------------------- output
 class HourlyWriter:
-    """Streams lines into data/open/kalshi_<YYYYmmddTHH>_<start>.jsonl.zst and,
+    """Streams lines into data/open/kalshi_<YYYYmmddTHH>_<start>_s<shard>.jsonl.zst and,
     when the UTC hour changes (or on shutdown), moves the finished file to
     data/closed/date=YYYY-MM-DD/."""
 
