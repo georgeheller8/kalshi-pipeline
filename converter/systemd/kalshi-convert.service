@@ -1,0 +1,13 @@
+# systemd USER unit for the laptop (not the VM: deploy.sh only installs deploy/systemd/).
+# Install: cp converter/systemd/kalshi-convert.* ~/.config/systemd/user/
+#          systemctl --user daemon-reload && systemctl --user enable --now kalshi-convert.timer
+#          sudo loginctl enable-linger "$USER"     # run even when nobody is logged in
+[Unit]
+Description=Convert raw Kalshi captures to Parquet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=%h/kalshi-convert/nightly.sh

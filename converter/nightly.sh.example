@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Nightly converter run for the Linux laptop.
+# Copy this file to ~/kalshi-convert/nightly.sh (OUTSIDE the repo, so updating the code
+# never edits a running script), chmod +x it, set the two values below, and let
+# kalshi-convert.timer (converter/systemd/) run it.
+#
+# Extra arguments are passed to convert.py, e.g. `nightly.sh --dry-run` or `--max-hours 5`.
+
+BUCKET=gh-kalshi-raw
+HC_URL=                 # healthchecks.io ping URL; empty = no pings
+
+main() {
+    local root="$HOME/kalshi-convert"
+    local repo="$root/kalshi-pipeline"
+    local log="$root/convert.log"
+    cd "$root" || exit 1
+    echo "==== $(date -Is) ====" >> "$log"
+
+    # Use the latest commit that passed CI (the same branch the collector deploys from).
+    if ! { git -C "$repo" fetch --quiet origin deploy &&
+           git -C "$repo" checkout --quiet --detach origin/deploy; } >> "$log" 2>&1; then
+        echo "could not update the code; running the version already checked out" >> "$log"
+    fi
+
+    .venv/bin/python -m pip install --quiet -r "$repo/converter/requirements.txt" >> "$log" 2>&1
+    .venv/bin/python "$repo/converter/convert.py" \
+        --raw "b2:$BUCKET/raw" --out "b2:$BUCKET/parquet" --work "$root/work" "$@" >> "$log" 2>&1
+    local rc=$?
+
+    if [ -n "$HC_URL" ]; then
+        if [ "$rc" -eq 0 ]; then
+            curl -fsS -m 10 --retry 3 "$HC_URL" > /dev/null 2>&1
+        else
+            curl -fsS -m 10 --retry 3 "$HC_URL/fail" > /dev/null 2>&1
+        fi
+    fi
+    return "$rc"
+}
+
+main "$@"; exit $?

@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly Kalshi Parquet conversion
+
+[Timer]
+OnCalendar=*-*-* 02:00
+# A run missed while the laptop was off or asleep starts at the next boot/wake.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
